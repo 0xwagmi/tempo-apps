@@ -1,31 +1,39 @@
-import { getContainer } from '@cloudflare/containers'
-import { and, eq } from 'drizzle-orm'
-import { drizzle } from 'drizzle-orm/d1'
 import { Hono } from 'hono'
+import * as z from 'zod/mini'
 import { Address, Hex } from 'ox'
+import { and, eq } from 'drizzle-orm'
+import { getRandom } from '@cloudflare/containers'
 import { createPublicClient, http, keccak256 } from 'viem'
-import {
-	getVyperAuxdataStyle,
-	getVyperImmutableReferences,
-	type ImmutableReferences,
-	type LinkReferences,
-	matchBytecode,
-} from '#bytecode-matching.ts'
-import { chains, CHAIN_IDS } from '#chains.ts'
 
 import {
 	codeTable,
-	compiledContractsSignaturesTable,
-	compiledContractsSourcesTable,
+	sourcesTable,
+	contractsTable,
+	signaturesTable,
+	type SignatureType,
+	verifiedContractsTable,
 	compiledContractsTable,
 	contractDeploymentsTable,
-	contractsTable,
-	type SignatureType,
-	signaturesTable,
-	sourcesTable,
-	verifiedContractsTable,
+	compiledContractsSourcesTable,
+	compiledContractsSignaturesTable,
 } from '#database/schema.ts'
-import { log, normalizeSourcePath, sourcifyError } from '#utilities.ts'
+import {
+	matchBytecode,
+	type LinkReferences,
+	getVyperAuxdataStyle,
+	type ImmutableReferences,
+	getVyperImmutableReferences,
+} from '#bytecode-matching.ts'
+import { chains, chainIds } from '#wagmi.config.ts'
+import { getLogger } from '#logger.ts'
+import {
+	formatError,
+	getDb,
+	sourcifyError,
+	normalizeSourcePath,
+} from '#utilities.ts'
+
+const logger = getLogger(['tempo'])
 
 /**
  * Legacy Sourcify-compatible routes for Foundry forge verify.
@@ -36,23 +44,35 @@ import { log, normalizeSourcePath, sourcifyError } from '#utilities.ts'
 
 const legacyVerifyRoute = new Hono<{ Bindings: Cloudflare.Env }>()
 
-interface LegacyVyperRequest {
-	address: string
-	chain: string
-	files: Record<string, string>
-	contractPath: string
-	contractName: string
-	compilerVersion: string
-	compilerSettings?: object
-	creatorTxHash?: string
-}
+const LegacyVyperRequestSchema = z.object({
+	address: z.string(),
+	chain: z.union([z.string(), z.number()]),
+	files: z.record(z.string(), z.string()),
+	contractPath: z.string(),
+	contractName: z.string(),
+	compilerVersion: z.string(),
+	compilerSettings: z.optional(z.record(z.string(), z.unknown())),
+	creatorTxHash: z.optional(z.string()),
+})
 
 // POST /verify/vyper - Legacy Sourcify Vyper verification (used by Foundry)
 legacyVerifyRoute.post('/vyper', async (context) => {
 	try {
-		const body = (await context.req.json()) as LegacyVyperRequest
+		const parsedBody = LegacyVyperRequestSchema.safeParse(
+			await context.req.json(),
+		)
+		if (!parsedBody.success) {
+			return sourcifyError(
+				context,
+				400,
+				'invalid_request',
+				`Invalid request body: ${parsedBody.error.message}`,
+			)
+		}
 
-		log.fromContext(context).info('vyper_verification_started', {
+		const body = parsedBody.data
+
+		logger.info('vyper_verification_started', {
 			address: body.address,
 			chainId: body.chain,
 			contractName: body.contractName,
@@ -70,7 +90,7 @@ legacyVerifyRoute.post('/vyper', async (context) => {
 		} = body
 
 		const chainId = Number(chain)
-		if (!CHAIN_IDS.includes(chainId)) {
+		if (!chainIds.includes(chainId)) {
 			return sourcifyError(
 				context,
 				400,
@@ -107,7 +127,7 @@ legacyVerifyRoute.post('/vyper', async (context) => {
 		}
 
 		// Check if already verified
-		const db = drizzle(context.env.CONTRACTS_DB)
+		const db = getDb(context.env.CONTRACTS_DB)
 		const addressBytes = Hex.toBytes(address)
 
 		const existingVerification = await db
@@ -133,7 +153,15 @@ legacyVerifyRoute.post('/vyper', async (context) => {
 			})
 		}
 
-		const chainConfig = chains[chainId as keyof typeof chains]
+		const chainConfig = chains.find((chain) => chain.id === chainId)
+		if (!chainConfig) {
+			return sourcifyError(
+				context,
+				400,
+				'unsupported_chain',
+				`The chain with chainId ${chainId} is not supported`,
+			)
+		}
 		const client = createPublicClient({
 			chain: chainConfig,
 			transport: http(chainConfig.rpcUrls.default.http.at(0)),
@@ -170,22 +198,34 @@ legacyVerifyRoute.post('/vyper', async (context) => {
 			},
 		}
 
-		// Compile via container
-		const container = getContainer(
-			context.env.VERIFICATION_CONTAINER,
-			'singleton',
-		)
+		// Compile via container (load-balanced across multiple instances)
+		const container = await getRandom(context.env.VERIFICATION_CONTAINER, 3)
 
-		const compileResponse = await container.fetch(
-			new Request('http://container/compile/vyper', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({
-					compilerVersion,
-					input: stdJsonInput,
+		let compileResponse: Response
+		try {
+			compileResponse = await container.fetch(
+				new Request('http://container/compile/vyper', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({
+						compilerVersion,
+						input: stdJsonInput,
+					}),
 				}),
-			}),
-		)
+			)
+		} catch (error) {
+			logger.error('container_fetch_failed', {
+				error: formatError(error),
+				address,
+				chain,
+			})
+			return sourcifyError(
+				context,
+				500,
+				'container_error',
+				error instanceof Error ? error.message : 'Container request failed',
+			)
+		}
 
 		if (!compileResponse.ok) {
 			const errorText = await compileResponse.text()
@@ -279,7 +319,7 @@ legacyVerifyRoute.post('/vyper', async (context) => {
 			return context.json(
 				{
 					error:
-						runtimeMatchResult.message ||
+						runtimeMatchResult.message ??
 						"The deployed and recompiled bytecode don't match.",
 				},
 				500,
@@ -447,16 +487,15 @@ legacyVerifyRoute.post('/vyper', async (context) => {
 				keccak256(Hex.fromBytes(contentBytes)),
 			)
 
-			await db
-				.insert(sourcesTable)
-				.values({
-					sourceHash: sourceHashSha256,
-					sourceHashKeccak: sourceHashKeccak,
-					content: sourceContent,
-					createdBy: auditUser,
-					updatedBy: auditUser,
-				})
-				.onConflictDoNothing()
+			const sourceInsert: typeof sourcesTable.$inferInsert = {
+				sourceHash: sourceHashSha256,
+				sourceHashKeccak: sourceHashKeccak,
+				content: sourceContent,
+				createdBy: auditUser,
+				updatedBy: auditUser,
+			}
+
+			await db.insert(sourcesTable).values(sourceInsert).onConflictDoNothing()
 
 			// Normalize path (convert absolute to relative)
 			const normalizedPath = normalizeSourcePath(sourcePath)
@@ -537,7 +576,9 @@ legacyVerifyRoute.post('/vyper', async (context) => {
 			],
 		})
 	} catch (error) {
-		log.fromContext(context).error('legacy_vyper_verification_failed', error)
+		logger.error('legacy_vyper_verification_failed', {
+			error: formatError(error),
+		})
 		return context.json({ error: 'An unexpected error occurred' }, 500)
 	}
 })
