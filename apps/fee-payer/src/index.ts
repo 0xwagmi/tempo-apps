@@ -1,7 +1,9 @@
 import { env } from 'cloudflare:workers'
 import { zValidator } from '@hono/zod-validator'
 import { Hono } from 'hono'
+import { cache } from 'hono/cache'
 import { cors } from 'hono/cors'
+import { HTTPException } from 'hono/http-exception'
 import { Handler } from 'tempo.ts/server'
 import { http } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
@@ -17,7 +19,16 @@ import { blockSignTransactionMiddleware } from './lib/block-sign-transaction.js'
 import { rateLimitMiddleware } from './lib/rate-limit.js'
 import { getUsage } from './lib/usage.js'
 
+const USAGE_CACHE_TTL = 60
+
 const app = new Hono()
+
+app.onError((error, c) => {
+	if (error instanceof HTTPException) return error.getResponse()
+
+	console.error('Unexpected error:', error)
+	return c.text('Internal Server Error', 500)
+})
 
 app.use(
 	'*',
@@ -35,6 +46,10 @@ app.use(
 
 app.get(
 	'/usage',
+	cache({
+		cacheName: 'fee-payer-usage',
+		cacheControl: `public, max-age=${USAGE_CACHE_TTL}, s-maxage=${USAGE_CACHE_TTL}`,
+	}),
 	zValidator(
 		'query',
 		z.object({
@@ -43,7 +58,13 @@ app.get(
 		}),
 	),
 	async (c) => {
-		const { blockTimestampFrom, blockTimestampTo } = c.req.valid('query')
+		const query = c.req.valid('query')
+		const blockTimestampFrom = query.blockTimestampFrom
+			? Math.floor(query.blockTimestampFrom / USAGE_CACHE_TTL) * USAGE_CACHE_TTL
+			: undefined
+		const blockTimestampTo = query.blockTimestampTo
+			? Math.floor(query.blockTimestampTo / USAGE_CACHE_TTL) * USAGE_CACHE_TTL
+			: undefined
 		const account = privateKeyToAccount(
 			env.SPONSOR_PRIVATE_KEY as `0x${string}`,
 		)
