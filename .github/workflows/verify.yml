@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
 
 env:
+  NODE_ENV: production
   NODE_OPTIONS: '--disable-warning=ExperimentalWarning --disable-warning=DeprecationWarning'
 
 jobs:
@@ -13,7 +14,7 @@ jobs:
 
     steps:
       - name: Clone repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           submodules: 'recursive'
 
@@ -22,6 +23,9 @@ jobs:
 
       - name: Check code and types
         run: pnpm gen:types && pnpm check
+
+      - name: Rebuild trusted lint dependency
+        run: pnpm rebuild @ast-grep/cli
 
       - name: Run Tempo Lints
         run: pnpm lint:tempo
